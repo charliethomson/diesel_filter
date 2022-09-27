@@ -3,32 +3,35 @@ extern crate diesel_filter;
 #[macro_use]
 extern crate diesel;
 
+use diesel::{prelude::*, PgConnection, RunQueryDsl};
+
 use crate::schema::thingies;
-use diesel::prelude::*;
 
 mod schema;
 
 #[derive(DieselFilter, Queryable, Debug)]
-#[table_name = "thingies"]
+#[diesel(table_name = thingies)]
 struct Thingy {
     pub id: i32,
-    #[filter(insensitive)]
-    pub name: String,
+    #[filter(insensitive, substring)]
+    pub name: Option<String>,
     #[filter(multiple)]
-    pub category: String,
-    pub other: String,
+    pub category: Option<String>,
+    pub other: Option<String>,
 }
 
 fn main() {
-    // Get a postgres DB connection
-    let conn = todo!();
+    let mut conn = todo!();
 
     let mut filters = ThingyFilters {
-        name: "coucou",
+        name: Some("cou".into()),
         category: None,
     };
 
-    let results = ThingyFilters::filtered(&filters, &conn);
+    let results = Thingy::filter(&filters).load::<Thingy>(&mut conn).unwrap();
+    let results2 = Thingy::filtered(&filters, &mut conn).unwrap();
 
     println!("{:?}", filters);
+    println!("{:?}", results);
+    println!("{:?}", results2);
 }

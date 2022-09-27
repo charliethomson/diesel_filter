@@ -1,8 +1,10 @@
-table! {
+// @generated automatically by Diesel CLI.
+
+diesel::table! {
     thingies (id) {
-        id -> Integer,
-        name -> Varchar,
-        category -> Varchar,
-        other -> Varchar,
+        id -> Int4,
+        name -> Nullable<Varchar>,
+        category -> Nullable<Varchar>,
+        other -> Nullable<Varchar>,
     }
 }

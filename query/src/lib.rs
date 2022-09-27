@@ -1,97 +1,25 @@
 use proc_macro::TokenStream;
-use proc_macro2::{Ident, Span};
-use quote::{quote, ToTokens};
+use proc_macro2::Ident;
+use quote::quote;
 use std::default::Default;
 use syn::{
     parse::{Parse, ParseStream},
-    parse_macro_input, Data, DeriveInput, Fields, Meta, NestedMeta, Path, Token, Type, TypePath,
+    parse_macro_input,
+    punctuated::Punctuated,
+    Data, DeriveInput, Fields, Meta, PathSegment, Token, Type,
 };
 
-struct Filter {
-    pub name: Ident,
-    pub ty: FilterableType,
-    pub opts: FilterOpts,
-}
+use crate::{filter::Filter, filterable_type::FilterableType, opts::FilterOpts};
 
-enum FilterableType {
-    String,
-    Uuid,
-    Foreign(String),
-}
+mod filter;
+mod filterable_type;
+mod opts;
 
 enum FilterKind {
     Basic,
     Substr,
     Insensitive,
     SubstrInsensitive,
-}
-
-struct FilterOpts {
-    multiple: bool,
-    kind: FilterKind,
-}
-
-impl Default for FilterOpts {
-    fn default() -> Self {
-        Self {
-            multiple: false,
-            kind: FilterKind::Basic,
-        }
-    }
-}
-
-impl From<Vec<NestedMeta>> for FilterOpts {
-    fn from(m: Vec<NestedMeta>) -> Self {
-        let meta = m
-            .into_iter()
-            .filter_map(|m| match m {
-                NestedMeta::Meta(m) => Some(m.path().to_owned()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        let matches =
-            |m: &Vec<Path>, tested: &[&str]| tested.iter().all(|t| m.iter().any(|m| m.is_ident(t)));
-
-        let kind = if matches(&meta, &["substring", "insensitive"]) {
-            FilterKind::SubstrInsensitive
-        } else if matches(&meta, &["substring"]) {
-            FilterKind::Substr
-        } else if matches(&meta, &["insensitive"]) {
-            FilterKind::Insensitive
-        } else {
-            FilterKind::Basic
-        };
-
-        Self {
-            multiple: matches(&meta, &["multiple"]),
-            kind,
-        }
-    }
-}
-
-impl From<&TypePath> for FilterableType {
-    fn from(ty: &TypePath) -> Self {
-        match ty.to_token_stream().to_string().replace(' ', "").as_str() {
-            "String" => Self::String,
-            "Uuid" => Self::Uuid,
-            "uuid::Uuid" => Self::Uuid,
-            "Option<String>" => Self::String,
-            "Option<Uuid>" => Self::Uuid,
-            "Option<uuid::Uuid>" => Self::Uuid,
-            other => Self::Foreign(other.to_string()),
-        }
-    }
-}
-
-impl From<FilterableType> for Ident {
-    fn from(val: FilterableType) -> Self {
-        match val {
-            FilterableType::String => Ident::new("String", Span::call_site()),
-            FilterableType::Uuid => Ident::new("Uuid", Span::call_site()),
-            FilterableType::Foreign(ty) => Ident::new(&ty, Span::call_site()),
-        }
-    }
 }
 
 struct TableName {
@@ -110,7 +38,22 @@ impl Parse for TableName {
     }
 }
 
-#[proc_macro_derive(DieselFilter, attributes(filter, table_name, pagination))]
+struct SchemaPrefix {
+    prefix: Punctuated<PathSegment, Token![::]>,
+}
+
+impl Parse for SchemaPrefix {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let prefix: Punctuated<PathSegment, Token![::]> =
+            input.parse_terminated::<PathSegment, Token![::]>(PathSegment::parse)?;
+        Ok(SchemaPrefix { prefix })
+    }
+}
+
+#[proc_macro_derive(
+    DieselFilter,
+    attributes(filter, table_name, pagination, schema_prefix, ts)
+)]
 pub fn filter(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
@@ -131,6 +74,17 @@ pub fn filter(input: TokenStream) -> TokenStream {
         .filter(|m| m.path.is_ident("pagination"))
         .last()
         .is_some();
+
+    let schema = match input
+        .attrs
+        .iter()
+        .filter(|attr| attr.path.is_ident("schema_prefix"))
+        .filter_map(|a| a.parse_args::<SchemaPrefix>().ok())
+        .last()
+    {
+        Some(SchemaPrefix { prefix }) => quote! { #prefix::schema },
+        None => quote! { crate::schema },
+    };
 
     let struct_name = input.ident;
     let mut filters = vec![];
@@ -254,9 +208,23 @@ pub fn filter(input: TokenStream) -> TokenStream {
         });
     }
 
+    let mut filters_derives = vec![quote! { utoipa::ToSchema }];
+    if cfg!(feature = "rocket") {
+        filters_derives.push(quote! { FromForm });
+    }
+    if cfg!(any(feature = "actix", feature = "axum")) {
+        filters_derives.push(quote! { serde::Deserialize });
+    }
+
+    filters_derives.push(quote! { Debug });
+
+    let attrs = quote! {
+            #[derive( #( #filters_derives, )* )]
+    };
+
     #[cfg(feature = "rocket")]
     let filters_struct = quote! {
-        #[derive(FromForm, Debug)]
+        #attrs
         pub struct #filter_struct_ident {
             #( #fields )*
         }
@@ -264,7 +232,7 @@ pub fn filter(input: TokenStream) -> TokenStream {
 
     #[cfg(any(feature = "actix", feature = "axum"))]
     let filters_struct = quote! {
-        #[derive(serde::Deserialize, Debug)]
+        #attrs
         pub struct #filter_struct_ident {
             #( #fields )*
         }
@@ -272,7 +240,7 @@ pub fn filter(input: TokenStream) -> TokenStream {
 
     #[cfg(not(any(feature = "rocket", feature = "actix", feature = "axum")))]
     let filters_struct = quote! {
-        #[derive(Debug)]
+        #attrs
         pub struct #filter_struct_ident {
             #( #fields )*
         }
@@ -291,9 +259,9 @@ pub fn filter(input: TokenStream) -> TokenStream {
                           .load_and_count::<#struct_name>(conn)
                     }
 
-                    pub fn filter<'a>(filters: &'a #filter_struct_ident) -> crate::schema::#table_name::BoxedQuery<'a, diesel::pg::Pg> {
+                    pub fn filter<'a>(filters: &'a #filter_struct_ident) -> #schema::#table_name::BoxedQuery<'a, diesel::pg::Pg> {
                         #( #uses )*
-                        let mut query = crate::schema::#table_name::table.into_boxed();
+                        let mut query = #schema::#table_name::table.into_boxed();
 
                         #( #queries )*
 
@@ -311,9 +279,9 @@ pub fn filter(input: TokenStream) -> TokenStream {
                         Self::filter(filters).load::<#struct_name>(conn)
                     }
 
-                    pub fn filter<'a>(filters: &'a #filter_struct_ident) -> crate::schema::#table_name::BoxedQuery<'a, diesel::pg::Pg> {
+                    pub fn filter<'a>(filters: &'a #filter_struct_ident) -> #schema::#table_name::BoxedQuery<'a, diesel::pg::Pg> {
                         #( #uses )*
-                        let mut query = crate::schema::#table_name::table.into_boxed();
+                        let mut query = #schema::#table_name::table.into_boxed();
 
                         #( #queries )*
 

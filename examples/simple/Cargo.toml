@@ -6,4 +6,4 @@ publish = false
 [dependencies]
 diesel_filter = { path = "../../core" }
 serde = { version = "1.0" }
-diesel = { version = "1.4", features = ["postgres"] }
+diesel = { version = "2.0.0", features = ["postgres"] }
